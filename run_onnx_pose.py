@@ -1,4 +1,4 @@
-"""Run raw three-scale YOLO26 pose ONNX output with host-side decoding and NMS."""
+"""Run raw three-scale YOLO26 pose ONNX or SoC outputs with host-side postprocessing."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import onnxruntime as ort
 
 NAMES = ("standing", "hands_up", "sitting", "fall_down", "ood", "skeleton")
 STRIDES = (8, 16, 32)
+CHANNELS = 61
+IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 SKELETON = (
     (0, 1),
     (0, 2),
@@ -79,8 +81,8 @@ def decode(outputs: list[np.ndarray], conf_threshold: float, iou_threshold: floa
     boxes, scores, class_ids, keypoints = [], [], [], []
     for output, stride in zip(outputs, STRIDES):
         _, channels, height, width = output.shape
-        if channels != 61:
-            raise ValueError(f"Expected 61 channels [ltrb, 6 classes, 17x3 keypoints], got {channels}")
+        if channels != CHANNELS:
+            raise ValueError(f"Expected {CHANNELS} channels [ltrb, 6 classes, 17x3 keypoints], got {channels}")
         grid_y, grid_x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
         anchors = np.stack((grid_x.reshape(-1) + 0.5, grid_y.reshape(-1) + 0.5), axis=1)
         prediction = output[0].transpose(1, 2, 0).reshape(-1, channels)
@@ -164,7 +166,7 @@ def draw_predictions(image: np.ndarray, predictions: np.ndarray, kpt_threshold: 
     return image
 
 
-def predict(session: ort.InferenceSession, image: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+def predict_onnx(session: ort.InferenceSession, image: np.ndarray, args: argparse.Namespace) -> np.ndarray:
     """Run ONNX Runtime and host-side postprocessing for one BGR frame."""
     input_height, input_width = session.get_inputs()[0].shape[2:]
     if input_height != input_width:
@@ -175,47 +177,139 @@ def predict(session: ort.InferenceSession, image: np.ndarray, args: argparse.Nam
     return scale_predictions(decode(outputs, args.conf, args.iou, args.max_det), ratio, padding, image.shape[:2])
 
 
-def main() -> None:
-    """Run image or video source and save annotated output plus per-frame JSON detections."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=Path("runs/pose/train-7/export/best.onnx"))
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("runs/pose/train-7/onnx_predict"))
-    parser.add_argument("--conf", type=float, default=0.25)
-    parser.add_argument("--iou", type=float, default=0.7)
-    parser.add_argument("--max-det", type=int, default=300)
-    parser.add_argument("--kpt-conf", type=float, default=0.5)
-    args = parser.parse_args()
-    if not args.model.is_file() or not args.source.is_file():
-        raise FileNotFoundError(f"Model/source not found: {args.model}, {args.source}")
+def load_soc_outputs(bin_dir: Path, image_stem: str, image_size: int) -> list[np.ndarray]:
+    """Load one image's three NCHW float32 SoC output tensors."""
+    sample_dir = bin_dir / image_stem
+    if not sample_dir.is_dir():
+        raise FileNotFoundError(f"SoC output directory not found: {sample_dir}")
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    session = ort.InferenceSession(str(args.model), providers=["CPUExecutionProvider"])
+    outputs = []
+    for index, stride in enumerate(STRIDES):
+        grid_size = image_size // stride
+        base = f"output{index}_{grid_size}_{grid_size}_{CHANNELS}_1"
+        paths = [sample_dir / f"{base}{suffix}" for suffix in (".dat", ".bin")]
+        path = next((candidate for candidate in paths if candidate.is_file()), None)
+        if path is None:
+            raise FileNotFoundError(f"SoC output not found: {paths[0]} or {paths[1]}")
+
+        output = np.fromfile(path, dtype=np.float32)
+        expected_size = CHANNELS * grid_size * grid_size
+        if output.size != expected_size:
+            raise ValueError(f"Invalid tensor size in {path}: got {output.size}, expected {expected_size}")
+        outputs.append(output.reshape(1, CHANNELS, grid_size, grid_size))
+    return outputs
+
+
+def predict_soc(bin_dir: Path, image_path: Path, image: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    """Load raw SoC tensors and run the same host-side postprocessing as ONNX mode."""
+    _, ratio, padding = letterbox(image, args.imgsz)
+    outputs = load_soc_outputs(bin_dir, image_path.stem, args.imgsz)
+    return scale_predictions(decode(outputs, args.conf, args.iou, args.max_det), ratio, padding, image.shape[:2])
+
+
+def resolve_image_paths(source: Path) -> list[Path] | None:
+    """Resolve an image file, image directory, or newline-delimited image list."""
+    if source.is_dir():
+        return sorted(path for path in source.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
+    if source.suffix.lower() in IMAGE_SUFFIXES:
+        return [source]
+    if source.suffix.lower() == ".txt":
+        paths = []
+        for line in source.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                path = Path(line)
+                paths.append(path if path.is_absolute() else source.parent / path)
+        return paths
+    return None
+
+
+def run_images(image_paths: list[Path], args: argparse.Namespace, session: ort.InferenceSession | None) -> None:
+    """Postprocess images and save one overlay per source plus combined JSON."""
+    records = {}
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise RuntimeError(f"Cannot read image: {image_path}")
+        predictions = (
+            predict_soc(args.soc_bin, image_path, image, args)
+            if args.soc_bin
+            else predict_onnx(session, image, args)
+        )
+        records[str(image_path)] = predictions.tolist()
+        destination = args.output / image_path.name
+        if not cv2.imwrite(str(destination), draw_predictions(image, predictions, args.kpt_conf)):
+            raise RuntimeError(f"Cannot save overlay: {destination}")
+
+    json_path = args.output / f"{args.source.stem}.json"
+    json_path.write_text(json.dumps(records), encoding="utf-8")
+    print(f"Saved {len(image_paths)} overlays to {args.output} and {json_path}")
+
+
+def run_video(session: ort.InferenceSession, args: argparse.Namespace) -> None:
+    """Run ONNX inference and postprocessing on a video source."""
     capture = cv2.VideoCapture(str(args.source))
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open source: {args.source}")
     fps = capture.get(cv2.CAP_PROP_FPS) or 30
     width, height = round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    is_image = capture.get(cv2.CAP_PROP_FRAME_COUNT) == 1
-    destination = args.output / (f"{args.source.stem}.jpg" if is_image else f"{args.source.stem}.mp4")
-    writer = None if is_image else cv2.VideoWriter(str(destination), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    destination = args.output / f"{args.source.stem}.mp4"
+    writer = cv2.VideoWriter(str(destination), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        capture.release()
+        raise RuntimeError(f"Cannot create output video: {destination}")
+
     records = []
     while True:
         ok, frame = capture.read()
         if not ok:
             break
-        predictions = predict(session, frame, args)
+        predictions = predict_onnx(session, frame, args)
         records.append(predictions.tolist())
-        annotated = draw_predictions(frame, predictions, args.kpt_conf)
-        if is_image:
-            cv2.imwrite(str(destination), annotated)
-        else:
-            writer.write(annotated)
+        writer.write(draw_predictions(frame, predictions, args.kpt_conf))
     capture.release()
-    if writer is not None:
-        writer.release()
-    (args.output / f"{args.source.stem}.json").write_text(json.dumps(records), encoding="utf-8")
-    print(f"Saved {destination} and {args.output / f'{args.source.stem}.json'}")
+    writer.release()
+    json_path = args.output / f"{args.source.stem}.json"
+    json_path.write_text(json.dumps(records), encoding="utf-8")
+    print(f"Saved {destination} and {json_path}")
+
+
+def main() -> None:
+    """Run ONNX or SoC output postprocessing and save overlays plus JSON detections."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, default=Path("runs/pose/train-7/export/best.onnx"))
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=Path("runs/pose/train-7/onnx_predict"))
+    parser.add_argument("--soc-bin", type=Path, help="Directory containing image-stem/output{0,1,2}_*.dat tensors")
+    parser.add_argument("--imgsz", type=int, default=832, help="Square model input size used for SoC inference")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--iou", type=float, default=0.7)
+    parser.add_argument("--max-det", type=int, default=300)
+    parser.add_argument("--kpt-conf", type=float, default=0.5)
+    args = parser.parse_args()
+    if not args.source.exists():
+        raise FileNotFoundError(f"Source not found: {args.source}")
+    if args.soc_bin:
+        if not args.soc_bin.is_dir():
+            raise FileNotFoundError(f"SoC output directory not found: {args.soc_bin}")
+        if args.imgsz <= 0 or any(args.imgsz % stride for stride in STRIDES):
+            raise ValueError(f"--imgsz must be positive and divisible by {max(STRIDES)}, got {args.imgsz}")
+    elif not args.model.is_file():
+        raise FileNotFoundError(f"Model not found: {args.model}")
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    session = None if args.soc_bin else ort.InferenceSession(str(args.model), providers=["CPUExecutionProvider"])
+    image_paths = resolve_image_paths(args.source)
+    if image_paths is not None:
+        if not image_paths:
+            raise FileNotFoundError(f"No images found in source: {args.source}")
+        run_images(image_paths, args, session)
+    elif args.soc_bin:
+        raise ValueError(
+            "SoC mode supports an image, image directory, or .txt image list; video tensors have no image-stem mapping"
+        )
+    else:
+        run_video(session, args)
 
 
 if __name__ == "__main__":
