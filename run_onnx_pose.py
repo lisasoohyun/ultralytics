@@ -119,10 +119,7 @@ def decode(outputs: list[np.ndarray], conf_threshold: float, iou_threshold: floa
     scores = np.concatenate(scores)
     class_ids = np.concatenate(class_ids)
     keypoints = np.concatenate(keypoints)
-    # Each class-local NMS index must map back to its original prediction.
-    kept = np.concatenate(
-        [np.flatnonzero(class_ids == cls)[nms(boxes[class_ids == cls], scores[class_ids == cls], iou_threshold)] for cls in np.unique(class_ids)]
-    )
+    kept = nms(boxes, scores, iou_threshold)
     kept = kept[np.argsort(scores[kept])[::-1][:max_det]]
     return np.concatenate((boxes[kept], scores[kept, None], class_ids[kept, None], keypoints[kept].reshape(-1, 51)), axis=1)
 
