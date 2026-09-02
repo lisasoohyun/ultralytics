@@ -140,6 +140,18 @@ def scale_predictions(predictions: np.ndarray, ratio: float, padding: tuple[int,
     return scaled
 
 
+def scale_stretched_predictions(predictions: np.ndarray, image_size: int, shape: tuple[int, int]) -> np.ndarray:
+    """Map predictions from a square, unpadded model input to the source image."""
+    scaled = predictions.copy()
+    height, width = shape
+    scaled[:, [0, 2]] = np.clip(scaled[:, [0, 2]] * width / image_size, 0, width)
+    scaled[:, [1, 3]] = np.clip(scaled[:, [1, 3]] * height / image_size, 0, height)
+    points = scaled[:, 6:].reshape(-1, 17, 3)
+    points[..., 0] = np.clip(points[..., 0] * width / image_size, 0, width)
+    points[..., 1] = np.clip(points[..., 1] * height / image_size, 0, height)
+    return scaled
+
+
 def draw_predictions(image: np.ndarray, predictions: np.ndarray, kpt_threshold: float) -> np.ndarray:
     """Draw detections and COCO-17 skeleton."""
     for prediction in predictions:
@@ -202,9 +214,9 @@ def load_soc_outputs(bin_dir: Path, image_stem: str, image_size: int) -> list[np
 
 def predict_soc(bin_dir: Path, image_path: Path, image: np.ndarray, args: argparse.Namespace) -> np.ndarray:
     """Load raw SoC tensors and run the same host-side postprocessing as ONNX mode."""
-    _, ratio, padding = letterbox(image, args.imgsz)
     outputs = load_soc_outputs(bin_dir, image_path.stem, args.imgsz)
-    return scale_predictions(decode(outputs, args.conf, args.iou, args.max_det), ratio, padding, image.shape[:2])
+    predictions = decode(outputs, args.conf, args.iou, args.max_det)
+    return scale_stretched_predictions(predictions, args.imgsz, image.shape[:2])
 
 
 def resolve_image_paths(source: Path) -> list[Path] | None:
